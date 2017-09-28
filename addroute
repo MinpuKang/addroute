@@ -1,0 +1,259 @@
+#!/bin/sh -f
+
+script_name=`basename $0`
+
+help_print()
+{
+    echo "This script is used to add route into Linux Server route table!"
+    echo 
+    echo "Usage: $script_name -ip IP/NETMASK -gw GATEWAY -if INTERFACE [-h HELP] "
+    echo " -ip  IP/NETMASK          Destination IP with netmask, host should be with netmask 32"
+    echo " -gw  GATEWAY             Gateway of Destination IP"
+    echo " -if  INTERFACE           Interface for routing"
+    echo " -h   HELP                Show the help"
+    echo 
+    echo "Example:"
+    echo " --------------------------------------------------------------"
+    echo
+    echo " Add a route:"
+    echo " user@host > $script_name -ip 1.1.1.1/24 -gw 2.2.2.2 -if eth0"
+    echo 
+    echo " --------------------------------------------------------------"
+    echo
+    exit 
+}
+
+#is empty or not
+is_empty()
+{
+    if [ -z $2 ];then
+    {
+        echo;echo "ERROR: missing value for \"$1\"!";echo;help_print;
+    }
+    fi
+}
+
+#IPv4 with netmask verify
+is_ipwithnetmask()
+{
+    IPWITHMASK=$1
+    regex="\s*\b(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])/(3[0-2]|[1-2][0-9]|[1-9])\b\s*"
+    is_ip=`echo $IPWITHMASK | egrep $regex | wc -l`
+    if [ $is_ip -eq 0 ]
+    then
+    {
+        echo;echo "The \"$IPWITHMASK\" is not a correct IP address with netmask!";echo;help_print;exit
+    }
+    fi
+}
+
+#IPv4 verify
+is_ipaddr()
+{
+    IPADDR=$1
+    regex="\s*\b(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[1-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[1-9])\b\s*"
+    is_ip=`echo $IPADDR | egrep $regex | wc -l`
+    if [ $is_ip -eq 0 ]
+    then
+    {
+        echo;echo "The \"$IPADDR\" is not a correct IP address!";echo;help_print;exit
+    }
+    else 
+    {
+        is_v4=`echo $IPADDR | awk -F "[[:blank:]]*25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[1-9][[:blank:]]*" '{print $5}'`
+        if [ ! -z $is_v4 ]
+        then
+        {
+            echo;echo "The \"$IPADDR\" is not a correct IP address!";echo;help_print;exit
+        }
+        fi
+    }
+    fi
+}
+
+#prefix to netmask
+des_mask=""
+prefix_mask()
+{
+    declare -i FULL_MASK_INT=4294967295
+    declare -i MASK_LEN=$1
+    declare -i LEFT_MOVE="32 - ${MASK_LEN}"
+    
+    declare -i N="${FULL_MASK_INT} << ${LEFT_MOVE}"
+    
+    declare -i H1="$N & 0x000000ff"
+    declare -i H2="($N & 0x0000ff00) >> 8"
+    declare -i L1="($N & 0x00ff0000) >> 16"
+    declare -i L2="($N & 0xff000000) >> 24"
+    
+    des_mask=`echo "$L2.$L1.$H2.$H1"`
+}
+
+#Check the interface
+is_interface()
+{
+    interface_name=$1
+    is_if=`ifconfig | grep "Link encap" |awk '{print $1}' | grep -wc $interface_name`
+    if [ $is_if -eq 0 ];then
+    {
+        echo;echo "Device \"$interface_name\" does not exist or isnot used!";echo;
+        dev_list=`ifconfig | grep "Link encap" |awk '{printf " "$1}'`
+        echo "Device list:$dev_list";echo;exit
+    }
+    fi
+}
+
+ip2num()
+{
+    L_IP_ADDR=$1
+    IP_ARRAY[0]=`echo $L_IP_ADDR | awk -F"." '{print $1}'`
+    IP_ARRAY[1]=`echo $L_IP_ADDR | awk -F"." '{print $2}'`
+    IP_ARRAY[2]=`echo $L_IP_ADDR | awk -F"." '{print $3}'`
+    IP_ARRAY[3]=`echo $L_IP_ADDR | awk -F"." '{print $4}'`
+    IPNetwork_num=`echo $(( ${IP_ARRAY[0]}<<24 | ${IP_ARRAY[1]}<<16 | ${IP_ARRAY[2]}<<8 | ${IP_ARRAY[3]} ))`
+    echo $IPNetwork_num
+}
+
+num2ip()
+{
+    N=$1 
+    H1=$(($N & 0x000000ff)) 
+    H2=$((($N & 0x0000ff00) >> 8)) 
+    L1=$((($N & 0x00ff0000) >> 16)) 
+    L2=$((($N & 0xff000000) >> 24)) 
+    echo $L2.$L1.$H2.$H1 
+}
+
+gw_match_if()
+{
+    Local_interface=$1
+    GW_IP=$2
+    IP_ADDR=$(ifconfig $Local_interface | awk '/inet addr:/{ print $2 }' | awk -F: '{print $2 }')
+    Mask=$(ifconfig $Local_interface | awk -F: '/Mask/{print $4}')
+    Bcast=$(ifconfig $Local_interface | awk -F: '/Mask/{print $3}' | awk '{print $1}')
+    
+    IFS=.
+    IPArray=($IP_ADDR)
+    MaskArray=($Mask)
+    NetArray=()
+    IPNetwork=""
+    for key in "${!IPArray[@]}";
+    do
+       NetArray[$key]=$(( ${IPArray[$key]} & ${MaskArray[$key]} ))
+    done
+    
+    IFS=
+    for (( i=0;i<${#NetArray[@]};i=$(($i+1)) ))
+    do
+    {
+        j=$(($i+1))
+        if [ $j != ${#NetArray[@]} ];then
+            IPNetwork=$IPNetwork${NetArray[$i]}"."
+        else
+            IPNetwork=$IPNetwork${NetArray[$i]}
+        fi
+    }
+    done 
+    
+    Network_num=`ip2num $IPNetwork`
+    Bcast_num=`ip2num $Bcast`
+    GW_IP_num=`ip2num $GW_IP`
+    IP_ADDR_num=`ip2num $IP_ADDR`
+    Host_first=`num2ip $(($Network_num+1))`
+    Host_last=`num2ip $(($Bcast_num-1))`
+    if [ $GW_IP_num -le $Network_num  ] || [ $GW_IP_num -ge $Bcast_num ];then
+    {
+        echo;echo " Gateway \"$GW_IP\" is not in the netowrk of the interface \"$Local_interface\"."
+        echo " Range of the network: $Host_first - $Host_last."
+        echo " IP \"$IP_ADDR\" for \"$Local_interface\" cannnot be set as gateway.";echo;exit
+    }
+    elif [ $GW_IP_num -eq $IP_ADDR_num ];then
+    {
+       echo;echo " IP \"$IP_ADDR\" for \"$Local_interface\" cannnot be set as gateway.";echo " Range of Gateway: $Host_first - $Host_last.";echo;exit
+    }
+    fi
+}
+
+route_add()
+{
+    ip_des=$1
+    ip_gw=$2
+    ip_if=$3
+    echo "ip route add $ip_des via $ip_gw dev $ip_if"
+    ip route add $ip_des via $ip_gw dev $ip_if
+    echo "===new routing===";ip route;echo
+    #echo -e "\033[44;37;1mip route add $des_ip via $gw_ip dev $if_next\033[0m"
+}
+
+#main
+is_root=`whoami`                                
+if [ $is_root != root ]                        
+then                                              
+{                                                 
+    echo                                          
+    echo  Please re-run the script as "root"!
+    echo                                          
+    exit                                          
+}                                                 
+fi 
+
+if [ -z $1 ];then
+{
+    echo "ERROR: missing value.";echo;help_print;
+}
+fi
+
+des_ip_mask=""
+gw_ip=""
+if_next=""
+
+while [ -n "$1" ]; do
+{
+    case $1 in
+        -ip) des_ip_mask=$2;is_empty -ip $des_ip_mask;is_ipwithnetmask $des_ip_mask;des_ip=`echo $des_ip_mask | awk -F "/" '{print $1}'`;des_prefix=`echo $des_ip_mask | awk -F "/" '{print $2}'`;prefix_mask $des_prefix;shift;;
+        -gw) gw_ip=$2;is_empty -gw $gw_ip;is_ipaddr $gw_ip;shift;;
+        -if) if_next=$2;is_empty -if $if_next;is_interface $if_next;shift;;
+        -h) help_print;;
+        *) echo "Invalid arg: $1";echo;help_print;;
+    esac;
+    shift
+}
+done
+
+is_empty -ip $des_ip_mask
+is_empty -gw $gw_ip
+is_empty -if $if_next
+
+gw_match_if $if_next $gw_ip
+
+if [ `ip route | grep -wc $des_ip` != 0 ];then
+{
+    echo;echo "\"$des_ip_mask\" is already routed:"
+    ip route | grep -w $des_ip;echo
+}
+else
+{
+    if [ $des_prefix -eq 32 ];then
+    {
+        route_add $des_ip $gw_ip $if_next
+    }
+    else
+    {
+        route_add $des_ip_mask $gw_ip $if_next
+    }
+    fi 
+}
+fi
+route_file="/etc/sysconfig/network/routes"
+if [ `cat $route_file | grep -wc $des_ip` != 0  ]; then
+{
+    echo;echo "\"$des_ip_mask\" is already routed:"
+    cat $route_file | grep -w $des_ip
+}
+else
+{
+    echo "$des_ip     $gw_ip    $des_mask $if_next" >> $route_file
+    echo "===new routing in route file===";cat $route_file;echo
+    #echo -e "\033[44;37;1m$des_ip     $gw_ip    $des_mask $if_next\033[0m"
+}
+fi
